@@ -9,12 +9,15 @@
 
 import argparse
 import getpass
+import hashlib
 import http.cookiejar
 import json
 import os
 import sys
+import tempfile
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
@@ -58,12 +61,78 @@ class LoginForm(HTMLParser):
 
 
 class YunyooClient:
-    def __init__(self, timeout=60):
+    def __init__(self, timeout=60, cache_file=None):
         self.timeout = timeout
-        self.cookies = http.cookiejar.CookieJar()
+        self.cache_file = Path(cache_file) if cache_file else None
+        self.cookies = http.cookiejar.LWPCookieJar()
         self.opener = build_opener(HTTPCookieProcessor(self.cookies))
         self.opener.addheaders = [("User-Agent", USER_AGENT)]
         self.jwt = None
+
+    def load_cache(self):
+        self.jwt = None
+        self.cookies.clear()
+        if self.cache_file is None:
+            return False
+        try:
+            self.cookies.load(str(self.cache_file), ignore_discard=True)
+        except (OSError, http.cookiejar.LoadError, ValueError):
+            self.cookies.clear()
+            return False
+        self.jwt = next((c.value for c in self.cookies
+                         if c.name == JWT_COOKIE
+                         and c.domain.lstrip(".") == "yunyoo.cc"
+                         and not c.is_expired()), None)
+        if not self.jwt:
+            self.cookies.clear()
+        return self.jwt is not None
+
+    def save_cache(self):
+        if self.cache_file is None:
+            return
+        temporary = None
+        try:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # 临时文件默认权限 0600，原子替换避免中断时留下半份缓存。
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                             dir=self.cache_file.parent) as stream:
+                temporary = Path(stream.name)
+                stream.write("#LWP-Cookies-2.0\n")
+                stream.write(self.cookies.as_lwp_str(ignore_discard=True))
+            os.replace(temporary, self.cache_file)
+        except OSError:
+            raise LoginError("无法写入认证缓存，请检查缓存目录权限") from None
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
+    def clear_cache(self):
+        self.cookies.clear()
+        self.jwt = None
+        if self.cache_file is not None:
+            try:
+                self.cache_file.unlink(missing_ok=True)
+            except OSError:
+                raise LoginError("无法删除失效的认证缓存，请检查缓存文件权限") from None
+
+    def userinfo(self, email, password_provider, host_id, gb_base=1024):
+        if self.load_cache():
+            try:
+                result = clash_userinfo(self.subscription_info(host_id), gb_base)
+            except LoginError:
+                # HTTP 错误、非 JSON、业务失败及字段错误均触发一次重新登录。
+                self.clear_cache()
+            else:
+                self.save_cache()
+                return result
+        # 延迟获取密码：缓存可用时，无需设置或输入密码。
+        password = password_provider()
+        if not password:
+            raise LoginError("密码不能为空")
+        self.login(email, password)
+        self.save_cache()
+        # 新登录后的请求只执行一次，失败直接报错，避免无限登录重试。
+        return clash_userinfo(self.subscription_info(host_id), gb_base)
 
     def request(self, path, data=None, headers=None):
         url = urljoin(BASE, path)
@@ -160,16 +229,19 @@ def main():
     parser.add_argument("--host-id", type=int, default=host_id, required=not host_id,
                         help="服务 ID，也可设置 YUNYOO_HOST_ID")
     parser.add_argument("--gb-base", type=int, choices=(1000, 1024), default=1024)
+    parser.add_argument("--cache-dir", type=Path,
+                        default=Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+                        / "yunyoo-statistics",
+                        help="认证缓存目录，默认 ~/.cache/yunyoo-statistics（支持 XDG_CACHE_HOME）")
     args = parser.parse_args()
     if not args.email.strip() or args.host_id <= 0:
         parser.error("邮箱不能为空，host ID 必须为正整数")
     try:
-        password = os.environ.get("YUNYOO_PASSWORD") or getpass.getpass("云悠密码：", stream=sys.stderr)
-        if not password:
-            raise LoginError("密码不能为空")
-        client = YunyooClient()
-        client.login(args.email, password)  # JWT 可通过 client.jwt 获取，不输出凭据。
-        print(clash_userinfo(client.subscription_info(args.host_id), args.gb_base))
+        account = hashlib.sha256(args.email.strip().lower().encode("utf-8")).hexdigest()
+        client = YunyooClient(cache_file=args.cache_dir / (account + ".cookies"))
+        def password_provider():
+            return os.environ.get("YUNYOO_PASSWORD") or getpass.getpass("云悠密码：", stream=sys.stderr)
+        print(client.userinfo(args.email, password_provider, args.host_id, args.gb_base))
     except (LoginError, EOFError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
